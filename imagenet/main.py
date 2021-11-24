@@ -12,11 +12,11 @@ import torch.backends.cudnn as cudnn
 import torch.distributed as dist
 import torch.optim
 import torch.multiprocessing as mp
-import torch.utils.data
-import torch.utils.data.distributed
 import torchvision.transforms as transforms
-import torchvision.datasets as datasets
 import torchvision.models as models
+
+from glob import glob
+from dali_pt_dataloader import dali_dataloader
 
 model_names = sorted(name for name in models.__dict__
     if name.islower() and not name.startswith("__")
@@ -52,6 +52,8 @@ parser.add_argument('-p', '--print-freq', default=10, type=int,
                     metavar='N', help='print frequency (default: 10)')
 parser.add_argument('--resume', default='', type=str, metavar='PATH',
                     help='path to latest checkpoint (default: none)')
+parser.add_argument('--save-path', default='', type=str, metavar='PATH',
+                    help='directory to save latest checkpoints (default: none)')
 parser.add_argument('-e', '--evaluate', dest='evaluate', action='store_true',
                     help='evaluate model on validation set')
 parser.add_argument('--pretrained', dest='pretrained', action='store_true',
@@ -68,6 +70,8 @@ parser.add_argument('--seed', default=None, type=int,
                     help='seed for initializing training. ')
 parser.add_argument('--gpu', default=None, type=int,
                     help='GPU id to use.')
+parser.add_argument('--gpu-aug', action='store_true',
+                    help='Use GPU for image decoding and augmentation.')
 parser.add_argument('--multiprocessing-distributed', action='store_true',
                     help='Use multi-processing distributed training to launch '
                          'N processes per node, which has N GPUs. This is the '
@@ -199,51 +203,41 @@ def main_worker(gpu, ngpus_per_node, args):
     cudnn.benchmark = True
 
     # Data loading code
-    traindir = os.path.join(args.data, 'train')
-    valdir = os.path.join(args.data, 'val')
-    normalize = transforms.Normalize(mean=[0.485, 0.456, 0.406],
-                                     std=[0.229, 0.224, 0.225])
+    train_loader = dali_dataloader(
+        device_id=0 if args.gpu is None else args.gpu,
+        batch_size=args.batch_size,
+        num_threads=args.workers,
+        tfrec_filenames=sorted(glob(f'{args.data}/train/*')),
+        tfrec_idx_filenames=sorted(glob(f'{args.data}/idx_files/train/*')),
+        resize=240,
+        crop=224,
+        shard_id=args.rank,
+        num_shards=args.world_size,
+        gpu_aug=args.gpu_aug,
+        gpu_out=torch.cuda.is_available(),
+        training=True,
+    )
 
-    train_dataset = datasets.ImageFolder(
-        traindir,
-        transforms.Compose([
-            transforms.RandomResizedCrop(224),
-            transforms.RandomHorizontalFlip(),
-            transforms.ToTensor(),
-            normalize,
-        ]))
-
-    val_dataset = datasets.ImageFolder(
-        valdir,
-        transforms.Compose([
-            transforms.Resize(256),
-            transforms.CenterCrop(224),
-            transforms.ToTensor(),
-            normalize,
-        ]))
-
-    if args.distributed:
-        train_sampler = torch.utils.data.distributed.DistributedSampler(train_dataset)
-        val_sampler = torch.utils.data.distributed.DistributedSampler(val_dataset)
-    else:
-        train_sampler = None
-        val_sampler = None
-
-    train_loader = torch.utils.data.DataLoader(
-        train_dataset, batch_size=args.batch_size, shuffle=(train_sampler is None),
-        num_workers=args.workers, pin_memory=True, sampler=train_sampler, drop_last=True)
-
-    val_loader = torch.utils.data.DataLoader(
-        val_dataset, batch_size=args.batch_size, shuffle=False,
-        num_workers=args.workers, pin_memory=True, sampler=val_sampler, drop_last=False)
+    val_loader = dali_dataloader(
+        device_id=0 if args.gpu is None else args.gpu,
+        batch_size=args.batch_size,
+        num_threads=args.workers,
+        tfrec_filenames=sorted(glob(f'{args.data}/validation/*')),
+        tfrec_idx_filenames=sorted(glob(f'{args.data}/idx_files/validation/*')),
+        resize=224,
+        crop=224,
+        shard_id=args.rank,
+        num_shards=args.world_size,
+        gpu_aug=args.gpu_aug,
+        gpu_out=torch.cuda.is_available(),
+        training=False,
+    )
 
     if args.evaluate:
         validate(val_loader, model, criterion, args)
         return
 
     for epoch in range(args.start_epoch, args.epochs):
-        if args.distributed:
-            train_sampler.set_epoch(epoch)
         adjust_learning_rate(optimizer, epoch, args)
 
         # train for one epoch
@@ -263,7 +257,7 @@ def main_worker(gpu, ngpus_per_node, args):
                 'state_dict': model.state_dict(),
                 'best_acc1': best_acc1,
                 'optimizer' : optimizer.state_dict(),
-            }, is_best)
+            }, is_best, args.save_path)
 
 
 def train(train_loader, model, criterion, optimizer, epoch, args):
@@ -281,14 +275,11 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
     model.train()
 
     end = time.time()
-    for i, (images, target) in enumerate(train_loader):
+    for i, (batch,) in enumerate(train_loader):
         # measure data loading time
         data_time.update(time.time() - end)
 
-        if args.gpu is not None:
-            images = images.cuda(args.gpu, non_blocking=True)
-        if torch.cuda.is_available():
-            target = target.cuda(args.gpu, non_blocking=True)
+        images, target = batch['data'], batch['label'].ravel()
 
         # compute output
         output = model(images)
@@ -328,11 +319,8 @@ def validate(val_loader, model, criterion, args):
 
     with torch.no_grad():
         end = time.time()
-        for i, (images, target) in enumerate(val_loader):
-            if args.gpu is not None:
-                images = images.cuda(args.gpu, non_blocking=True)
-            if torch.cuda.is_available():
-                target = target.cuda(args.gpu, non_blocking=True)
+        for i, (batch,) in enumerate(val_loader):
+            images, target = batch['data'], batch['label'].ravel()
 
             # compute output
             output = model(images)
@@ -363,10 +351,11 @@ def validate(val_loader, model, criterion, args):
     return top1.avg
 
 
-def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
+def save_checkpoint(state, is_best, folder, filename='checkpoint.pth.tar'):
+    filename = os.path.join(folder, filename)
     torch.save(state, filename)
     if is_best:
-        shutil.copyfile(filename, 'model_best.pth.tar')
+        shutil.copyfile(filename, os.path.join(folder, 'model_best.pth.tar'))
 
 
 class AverageMeter(object):
