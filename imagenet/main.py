@@ -4,6 +4,7 @@ import random
 import shutil
 import time
 import warnings
+from enum import Enum
 
 import torch
 import torch.nn as nn
@@ -314,10 +315,10 @@ def train(train_loader, model, criterion, optimizer, epoch, args):
 
 
 def validate(val_loader, model, criterion, args):
-    batch_time = AverageMeter('Time', ':6.3f')
-    losses = AverageMeter('Loss', ':.4e')
-    top1 = AverageMeter('Acc@1', ':6.2f')
-    top5 = AverageMeter('Acc@5', ':6.2f')
+    batch_time = AverageMeter('Time', ':6.3f', Summary.NONE)
+    losses = AverageMeter('Loss', ':.4e', Summary.NONE)
+    top1 = AverageMeter('Acc@1', ':6.2f', Summary.AVERAGE)
+    top5 = AverageMeter('Acc@5', ':6.2f', Summary.AVERAGE)
     progress = ProgressMeter(
         len(val_loader),
         [batch_time, losses, top1, top5],
@@ -352,13 +353,10 @@ def validate(val_loader, model, criterion, args):
                 progress.display(i)
 
         if args.distributed:
-            top1.all_reduce(args.gpu)
-            top5.all_reduce(args.gpu)
-
-        if not args.distributed or args.rank == 0:
-            # TODO: this should also be done with the ProgressMeter
-            print(' * Acc@1 {top1.avg:.3f} Acc@5 {top5.avg:.3f}'
-                  .format(top1=top1, top5=top5))
+            for meter in progress.meters:
+                meter.all_reduce(args.gpu)
+        if (not args.distributed or args.rank == 0):
+            progress.display_summary()
 
     return top1.avg
 
@@ -368,12 +366,18 @@ def save_checkpoint(state, is_best, filename='checkpoint.pth.tar'):
     if is_best:
         shutil.copyfile(filename, 'model_best.pth.tar')
 
+class Summary(Enum):
+    NONE = 0
+    AVERAGE = 1
+    SUM = 2
+    COUNT = 3
 
 class AverageMeter(object):
     """Computes and stores the average and current value"""
-    def __init__(self, name, fmt=':f'):
+    def __init__(self, name, fmt=':f', summary_type=Summary.AVERAGE):
         self.name = name
         self.fmt = fmt
+        self.summary_type = summary_type
         self.reset()
 
     def reset(self):
@@ -397,6 +401,21 @@ class AverageMeter(object):
     def __str__(self):
         fmtstr = '{name} {val' + self.fmt + '} ({avg' + self.fmt + '})'
         return fmtstr.format(**self.__dict__)
+    
+    def summary(self):
+        fmtstr = ''
+        if self.summary_type is Summary.NONE:
+            fmtstr = ''
+        elif self.summary_type is Summary.AVERAGE:
+            fmtstr = '{name} {avg:.3f}'
+        elif self.summary_type is Summary.SUM:
+            fmtstr = '{name} {sum:.3f}'
+        elif self.summary_type is Summary.COUNT:
+            fmtstr = '{name} {count:.3f}'
+        else:
+            raise ValueError('invalid summary type %r' % self.summary_type)
+        
+        return fmtstr.format(**self.__dict__)
 
 
 class ProgressMeter(object):
@@ -409,6 +428,11 @@ class ProgressMeter(object):
         entries = [self.prefix + self.batch_fmtstr.format(batch)]
         entries += [str(meter) for meter in self.meters]
         print('\t'.join(entries))
+        
+    def display_summary(self):
+        entries = [" *"]
+        entries += [meter.summary() for meter in self.meters]
+        print(' '.join(entries))
 
     def _get_batch_fmtstr(self, num_batches):
         num_digits = len(str(num_batches // 1))
